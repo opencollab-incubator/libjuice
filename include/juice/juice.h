@@ -52,6 +52,30 @@ extern "C" {
 
 typedef struct juice_agent juice_agent_t;
 
+typedef enum juice_stun_binding_state {
+	JUICE_STUN_BINDING_PENDING = 0,
+	JUICE_STUN_BINDING_SUCCEEDED,
+	JUICE_STUN_BINDING_FAILED
+} juice_stun_binding_state_t;
+
+/** Latest observation from one resolved STUN server, independent of ICE peers.
+ * Addresses are numeric, without a port. An empty mapped address and UINT64_MAX
+ * age mean no successful observation. Ages use the library's monotonic clock.
+ * A mapping is an observation, not proof of reachability or a NAT lease: callers
+ * decide how old an observation may be. Reading never refreshes its age.
+ */
+typedef struct juice_stun_binding {
+	char server_address[JUICE_MAX_ADDRESS_STRING_LEN];
+	uint16_t server_port;
+	char mapped_address[JUICE_MAX_ADDRESS_STRING_LEN];
+	uint16_t mapped_port;
+	juice_stun_binding_state_t state;
+	uint64_t successful_responses;
+	uint64_t failed_transactions;
+	uint64_t mapping_revision;
+	uint64_t last_success_age_ms;
+} juice_stun_binding_t;
+
 typedef enum juice_state {
 	JUICE_STATE_DISCONNECTED = 0,
 	JUICE_STATE_GATHERING,
@@ -152,6 +176,23 @@ JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);
 JUICE_EXPORT void juice_destroy(juice_agent_t *agent);
 
 JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent);
+
+/** Opt in before gathering to persistent STUN-server monitoring. The default is
+ * false. Monitoring retries failed transactions and keeps server bindings warm
+ * even after ICE nomination. It uses the agent's actual UDP connection, including
+ * its shared MUX socket, and works without a remote description or ICE peer.
+ * Normal ICE candidate SDP remains a gathering history; use get_stun_binding for
+ * the current mapping. No refresh is performed by get_stun_binding itself.
+ */
+JUICE_EXPORT int juice_set_stun_monitoring(juice_agent_t *agent, bool enabled);
+
+/** Copy the observation for a zero-based resolved STUN-server index.
+ * Returns JUICE_ERR_NOT_AVAIL if the index has no resolved server (including
+ * before/during resolution or after resolution failure). Index ordering is
+ * stable for the lifetime of the agent; each IPv4/IPv6 server has its own entry.
+ */
+JUICE_EXPORT int juice_get_stun_binding(juice_agent_t *agent, unsigned int index,
+                                       juice_stun_binding_t *binding);
 JUICE_EXPORT int juice_get_local_description(juice_agent_t *agent, char *buffer, size_t size);
 JUICE_EXPORT int juice_set_remote_description(juice_agent_t *agent, const char *sdp);
 JUICE_EXPORT int juice_add_remote_candidate(juice_agent_t *agent, const char *sdp);

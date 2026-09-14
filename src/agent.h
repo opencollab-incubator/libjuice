@@ -118,6 +118,16 @@ typedef struct agent_stun_entry {
 	bool transaction_id_expired;
 	tcp_state_t tcp_state;
 
+	// STUN server observations; never used as ICE peer consent.
+	addr_record_t binding_mapped;
+	timestamp_t binding_success_timestamp;
+	juice_stun_binding_state_t binding_state;
+	uint64_t binding_successes;
+	uint64_t binding_failures;
+	uint64_t binding_revision;
+	bool binding_started;
+	bool binding_finished;
+
 	// TURN
 	agent_turn_state_t *turn;
 	unsigned int turn_redirections;
@@ -130,6 +140,7 @@ struct juice_agent {
 	juice_state_t state;
 	agent_mode_t mode;
 	juice_ice_tcp_mode_t ice_tcp_mode;
+	bool stun_monitoring;
 
 	ice_description_t local;
 	ice_description_t remote;
@@ -160,6 +171,8 @@ juice_agent_t *agent_create(const juice_config_t *config);
 void agent_destroy(juice_agent_t *agent);
 
 int agent_gather_candidates(juice_agent_t *agent);
+int agent_set_stun_monitoring(juice_agent_t *agent, bool enabled);
+int agent_get_stun_binding(juice_agent_t *agent, unsigned int index, juice_stun_binding_t *binding);
 int agent_resolve_servers(juice_agent_t *agent);
 int agent_get_local_description(juice_agent_t *agent, char *buffer, size_t size);
 int agent_set_remote_description(juice_agent_t *agent, const char *sdp);
