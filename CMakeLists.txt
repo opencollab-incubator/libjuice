@@ -263,6 +263,8 @@ option(PENDING_MUX_TESTS "Build isolated incoming ICE regression tests (Linux)" 
 option(STUN_MONITORING_TESTS "Build local UDP STUN observation tests with production timers (Linux)" OFF)
 if(STUN_MONITORING_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_testing()
+    add_executable(stun-monitor-probe test/stun_monitor_probe.c)
+    target_link_libraries(stun-monitor-probe PRIVATE juice-static Threads::Threads)
     foreach(platform IN ITEMS windows macos)
         add_executable(timestamp-${platform}-test test/timestamp_platform.c src/timestamp.c)
         target_include_directories(timestamp-${platform}-test PRIVATE test/platform/${platform} src)
