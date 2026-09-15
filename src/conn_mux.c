@@ -13,6 +13,7 @@
 #include "stun.h"
 #include "thread.h"
 #include "udp.h"
+#include "udp_send_limits.h"
 
 #include <assert.h>
 #include <string.h>
@@ -909,15 +910,21 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
+	if (!udp_send_reserve(agent, dst, size)) {
+		mutex_unlock(&registry_impl->send_mutex);
+		return -SEACCES;
+	}
 	int ret = udp_sendto(registry_impl->sock, data, size, dst);
+	int send_error = ret < 0 ? sockerrno : 0;
+	udp_send_finish(agent, ret);
 	if (ret < 0) {
-		ret = -sockerrno;
-		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
+		ret = -send_error;
+		if (send_error == SEAGAIN || send_error == SEWOULDBLOCK)
 			JLOG_INFO("Send failed, buffer is full");
-		else if (sockerrno == SEMSGSIZE)
+		else if (send_error == SEMSGSIZE)
 			JLOG_WARN("Send failed, datagram is too large");
 		else
-			JLOG_WARN("Send failed, errno=%d", sockerrno);
+			JLOG_WARN("Send failed, errno=%d", send_error);
 	}
 
 	mutex_unlock(&registry_impl->send_mutex);

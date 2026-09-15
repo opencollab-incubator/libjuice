@@ -106,7 +106,9 @@ See [test/server.c](https://github.com/paullouisageneau/libjuice/blob/master/tes
 For a shared UDP endpoint that accepts connections asynchronously, see
 [pending connections](docs/pending-connections.md).
 
+For persistent STUN binding observations on the same UDP socket, see
+[STUN monitoring](docs/stun-monitoring.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/paullouisageneau/libjuice/blob/master/CONTRIBUTING.md) for contribution guidelines.
-

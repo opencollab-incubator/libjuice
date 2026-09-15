@@ -9,33 +9,33 @@
 #include "timestamp.h"
 
 #ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601 // Match the minimum supported by socket.h (Windows 7)
+#endif
 #include <windows.h>
 #else
 #include <time.h>
 
-// clock_gettime() is not implemented on older versions of OS X (< 10.12)
+// clock_gettime() is not implemented on older versions of OS X (< 10.12).
+// Use its monotonic Mach clock, never a wall-clock substitute.
 #if defined(__APPLE__) && !defined(CLOCK_MONOTONIC)
-#include <sys/time.h>
-#define CLOCK_MONOTONIC 0
-int clock_gettime(int clk_id, struct timespec *t) {
-	(void)clk_id;
-
-	// gettimeofday() does not return monotonic time but it should be good enough.
-	struct timeval now;
-	if (gettimeofday(&now, NULL))
-		return -1;
-
-	t->tv_sec = now.tv_sec;
-	t->tv_nsec = now.tv_usec * 1000;
-	return 0;
-}
+#include <mach/mach_time.h>
+#define JUICE_USE_MACH_CLOCK 1
 #endif // defined(__APPLE__) && !defined(CLOCK_MONOTONIC)
 
 #endif
 
 timestamp_t current_timestamp() {
 #ifdef _WIN32
-	return (timestamp_t)GetTickCount();
+	return (timestamp_t)GetTickCount64();
+#elif defined(JUICE_USE_MACH_CLOCK)
+	mach_timebase_info_data_t timebase;
+	if (mach_timebase_info(&timebase) != 0 || timebase.denom == 0)
+		return 0;
+	// Floating-point conversion avoids overflowing an intermediate integer
+	// product on long-running systems with a nontrivial Mach timebase ratio.
+	return (timestamp_t)((long double)mach_absolute_time() * timebase.numer /
+	                     timebase.denom / 1000000.0L);
 #else // POSIX
 	struct timespec ts;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts))
