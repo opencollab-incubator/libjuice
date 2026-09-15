@@ -141,6 +141,12 @@ struct juice_agent {
 	agent_mode_t mode;
 	juice_ice_tcp_mode_t ice_tcp_mode;
 	bool stun_monitoring;
+	// Immutable configuration after gathering; only counters use this independent lock.
+	bool udp_send_limited;
+	mutex_t udp_send_mutex;
+	juice_udp_send_limits_t udp_send_limits;
+	addr_record_t udp_send_destination;
+	juice_udp_send_stats_t udp_send_stats;
 
 	ice_description_t local;
 	ice_description_t remote;

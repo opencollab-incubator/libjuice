@@ -254,6 +254,7 @@ void agent_destroy(juice_agent_t *agent) {
 	}
 	free(agent->config.turn_servers);
 	free((void *)agent->config.bind_address);
+	if (agent->udp_send_limited) mutex_destroy(&agent->udp_send_mutex);
 	free(agent);
 
 #ifdef _WIN32
@@ -703,6 +704,8 @@ int agent_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, cons
 }
 
 int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server) {
+	if (agent->udp_send_limited)
+		return JUICE_ERR_INVALID;
 	if (agent->conn_impl) {
 		// The array must no be reallocated anymore after gathering started
 		JLOG_WARN("Unable to add TURN server, candidates gathering already started");
@@ -2857,6 +2860,8 @@ agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent, const add
 }
 
 int agent_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode) {
+	if (agent->udp_send_limited && ice_tcp_mode != JUICE_ICE_TCP_MODE_NONE)
+		return JUICE_ERR_INVALID;
 	if (agent->conn_impl) {
 		JLOG_WARN("Unable to set ICE attributes, candidates gathering already started");
 		return JUICE_ERR_FAILED;

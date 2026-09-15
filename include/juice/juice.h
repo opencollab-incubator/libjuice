@@ -175,6 +175,42 @@ typedef struct juice_config {
 JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config);
 JUICE_EXPORT void juice_destroy(juice_agent_t *agent);
 
+/** Immutable per-agent limits on actual mux UDP send attempts, including ICE/STUN,
+ * DTLS and application transport. Zero/unconfigured agents remain unlimited.
+ * Install exactly once before gathering; TCP and TURN are not supported.
+ * deadline_monotonic_ms uses juice_monotonic_time_ms(), and is never restarted.
+ * Optional destination is numeric, without a zone or DNS name; address/port must
+ * both be supplied. A failed OS send consumes one datagram reservation too. */
+typedef struct juice_udp_send_limits {
+	uint32_t max_datagrams;
+	uint32_t max_payload_bytes;
+	uint64_t deadline_monotonic_ms;
+	const char *destination_address;
+	uint16_t destination_port;
+} juice_udp_send_limits_t;
+
+typedef enum juice_udp_send_rejection {
+	JUICE_UDP_SEND_NOT_REJECTED = 0,
+	JUICE_UDP_SEND_EXPIRED = 1,
+	JUICE_UDP_SEND_COUNT = 2,
+	JUICE_UDP_SEND_SIZE = 3,
+	JUICE_UDP_SEND_DESTINATION = 4,
+	JUICE_UDP_SEND_UNSUPPORTED = 5
+} juice_udp_send_rejection_t;
+
+typedef struct juice_udp_send_stats {
+	uint64_t reserved_datagrams;
+	uint64_t sent_datagrams;
+	uint64_t sent_bytes;
+	uint64_t rejected_datagrams;
+	juice_udp_send_rejection_t last_rejection;
+} juice_udp_send_stats_t;
+
+JUICE_EXPORT uint64_t juice_monotonic_time_ms(void);
+JUICE_EXPORT int juice_set_udp_send_limits(juice_agent_t *agent, const juice_udp_send_limits_t *limits);
+/** One atomic owned snapshot; NOT_AVAIL means this agent has no installed limits. */
+JUICE_EXPORT int juice_get_udp_send_stats(juice_agent_t *agent, juice_udp_send_stats_t *stats);
+
 JUICE_EXPORT int juice_gather_candidates(juice_agent_t *agent);
 
 /** Opt in before gathering to persistent STUN-server monitoring. The default is
