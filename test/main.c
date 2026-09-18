@@ -13,6 +13,7 @@
 int test_crc32(void);
 int test_base64(void);
 int test_stun(void);
+int test_stun_monitoring(void);
 int test_connectivity(void);
 int test_thread(void);
 int test_mux(void);
@@ -51,6 +52,12 @@ int main(int argc, char **argv) {
 	printf("\nRunning STUN parsing implementation test...\n");
 	if (test_stun()) {
 		fprintf(stderr, "STUN parsing implementation test failed\n");
+		return -3;
+	}
+
+	printf("\nRunning STUN monitoring test...\n");
+	if (test_stun_monitoring()) {
+		fprintf(stderr, "STUN monitoring test failed\n");
 		return -3;
 	}
 

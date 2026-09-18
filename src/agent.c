@@ -78,6 +78,72 @@ static bool entry_is_tcp(agent_stun_entry_t *entry) {
 	return (entry->pair && entry->pair->remote->transport != ICE_CANDIDATE_TRANSPORT_UDP);
 }
 
+static void binding_failed(agent_stun_entry_t *entry) {
+	if (entry->type != AGENT_STUN_ENTRY_TYPE_SERVER || entry->binding_finished)
+		return;
+	entry->binding_finished = true;
+	entry->binding_state = JUICE_STUN_BINDING_FAILED;
+	++entry->binding_failures;
+}
+
+static void binding_started(agent_stun_entry_t *entry) {
+	if (entry->type != AGENT_STUN_ENTRY_TYPE_SERVER)
+		return;
+	// A keepalive transaction has a bounded response window, ending at the next
+	// refresh. Replacing it must not make its unanswered request look successful.
+	if (entry->binding_started)
+		binding_failed(entry);
+	entry->binding_started = true;
+	entry->binding_finished = false;
+	entry->binding_state = JUICE_STUN_BINDING_PENDING;
+}
+
+int agent_set_stun_monitoring(juice_agent_t *agent, bool enabled) {
+	if (agent->conn_impl)
+		return JUICE_ERR_FAILED;
+	agent->stun_monitoring = enabled;
+	return JUICE_ERR_SUCCESS;
+}
+
+int agent_get_stun_binding(juice_agent_t *agent, unsigned int index, juice_stun_binding_t *binding) {
+	conn_lock(agent);
+	for (int i = 0; i < agent->entries_count; ++i) {
+		agent_stun_entry_t *entry = agent->entries + i;
+		if (entry->type != AGENT_STUN_ENTRY_TYPE_SERVER)
+			continue;
+		if (index--)
+			continue;
+		juice_stun_binding_t result = {0};
+		if (getnameinfo((const struct sockaddr *)&entry->record.addr, entry->record.len,
+		                result.server_address, sizeof(result.server_address), NULL, 0,
+		                NI_NUMERICHOST)) {
+			conn_unlock(agent);
+			return JUICE_ERR_FAILED;
+		}
+		result.server_port = addr_get_port((const struct sockaddr *)&entry->record.addr);
+		result.last_success_age_ms = UINT64_MAX;
+		if (entry->binding_successes) {
+			if (getnameinfo((const struct sockaddr *)&entry->binding_mapped.addr,
+			                entry->binding_mapped.len, result.mapped_address,
+			                sizeof(result.mapped_address), NULL, 0, NI_NUMERICHOST)) {
+				conn_unlock(agent);
+				return JUICE_ERR_FAILED;
+			}
+			result.mapped_port = addr_get_port((const struct sockaddr *)&entry->binding_mapped.addr);
+			result.last_success_age_ms = (uint64_t)(current_timestamp() - entry->binding_success_timestamp);
+		}
+		result.state = entry->binding_state;
+		result.successful_responses = entry->binding_successes;
+		result.failed_transactions = entry->binding_failures;
+		result.mapping_revision = entry->binding_revision;
+		*binding = result;
+		conn_unlock(agent);
+		return JUICE_ERR_SUCCESS;
+	}
+	conn_unlock(agent);
+	return JUICE_ERR_NOT_AVAIL;
+}
+
 juice_agent_t *agent_create(const juice_config_t *config) {
 	JLOG_VERBOSE("Creating agent");
 
@@ -945,6 +1011,8 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 						           i, record_str, entry->retransmissions);
 					}
 				}
+				if (!entry->binding_started || entry->transaction_id_expired)
+					binding_started(entry);
 				if (entry->transaction_id_expired) {
 					juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 					entry->transaction_id_expired = false;
@@ -976,6 +1044,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			JLOG_DEBUG("STUN entry %d: Failed", i);
 			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			entry->next_transmission = 0;
+			binding_failed(entry);
 
 			switch (entry->type) {
 			case AGENT_STUN_ENTRY_TYPE_RELAY:
@@ -986,6 +1055,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			case AGENT_STUN_ENTRY_TYPE_SERVER:
 				JLOG_INFO("STUN server binding failed");
 				agent_update_gathering_done(agent);
+				if (agent->stun_monitoring) {
+					entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
+					agent_arm_keepalive(agent, entry);
+				}
 				break;
 
 			default:
@@ -1016,6 +1089,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			JLOG_DEBUG("STUN entry %d: Sending keepalive", i);
 
+			binding_started(entry);
 			juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 			entry->transaction_id_expired = false;
 
@@ -1054,6 +1128,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			if (ret < 0) {
 				JLOG_WARN("Sending keepalive failed");
+				binding_failed(entry);
 				agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
 				continue;
 			}
@@ -1126,6 +1201,9 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 		JLOG_WARN("Lost connectivity");
 		agent_change_state(agent, JUICE_STATE_FAILED);
 		atomic_store(&agent->selected_entry, NULL); // disallow sending
+		// Keep STUN monitoring scheduled even though the ICE session has failed.
+		if (agent->stun_monitoring)
+			goto schedule_entries;
 		return 0;
 	}
 
@@ -1187,6 +1265,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			for (int i = 0; i < agent->entries_count; ++i) {
 				agent_stun_entry_t *entry = agent->entries + i;
 				if (entry != nominated_entry && entry != relay_entry &&
+				    !(agent->stun_monitoring && entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) &&
 				    entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE)
 					entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED;
 			}
@@ -1225,12 +1304,16 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			JLOG_INFO("Connectivity timer expired");
 			agent_change_state(agent, JUICE_STATE_FAILED);
 			atomic_store(&agent->selected_entry, NULL); // disallow sending
+			// Keep STUN monitoring scheduled even though the ICE session has failed.
+			if (agent->stun_monitoring)
+				goto schedule_entries;
 			return 0;
 		} else if (*next_timestamp > agent->pac_timestamp) {
 			*next_timestamp = agent->pac_timestamp;
 		}
 	}
 
+schedule_entries:
 	for (int i = 0; i < agent->entries_count; ++i) {
 		agent_stun_entry_t *entry = agent->entries + i;
 		if (entry->next_transmission && *next_timestamp > entry->next_transmission)
@@ -1369,6 +1452,12 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 		entry = agent_find_entry_from_transaction_id(agent, msg->transaction_id);
 		if (!entry) {
 			JLOG_DEBUG("No STUN entry matching transaction ID, ignoring");
+			return -1;
+		}
+		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER &&
+		    (!addr_record_is_equal(src, &entry->record, true) || relayed ||
+		     !entry->binding_started || entry->binding_finished)) {
+			JLOG_DEBUG("Ignoring STUN server response from an unexpected source or completed transaction");
 			return -1;
 		}
 	} else {
@@ -1526,15 +1615,29 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 		JLOG_DEBUG("Received STUN Binding success response from %s",
 		           entry->type == AGENT_STUN_ENTRY_TYPE_CHECK ? "peer" : "server");
 
-		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER)
+		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
+			if (!msg->mapped.len) {
+				JLOG_WARN("Ignoring STUN Binding success without a mapped address");
+				return -1;
+			}
+			if (!entry->binding_successes ||
+			    !addr_record_is_equal(&entry->binding_mapped, &msg->mapped, true))
+				++entry->binding_revision;
+			entry->binding_mapped = msg->mapped;
+			entry->binding_success_timestamp = current_timestamp();
+			entry->binding_state = JUICE_STUN_BINDING_SUCCEEDED;
+			entry->binding_finished = true;
+			++entry->binding_successes;
 			JLOG_INFO("STUN server binding successful");
+		}
 
 		if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
 			entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED;
 			entry->next_transmission = 0;
 		}
 
-		if (!agent->selected_pair || !agent->selected_pair->nominated) {
+		if (!agent->selected_pair || !agent->selected_pair->nominated ||
+		    (agent->stun_monitoring && entry->type == AGENT_STUN_ENTRY_TYPE_SERVER)) {
 			// We want to send keepalives now
 			entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
 			agent_arm_keepalive(agent, entry);
@@ -1652,8 +1755,13 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 			}
 		} else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
 			JLOG_INFO("STUN server binding failed (unrecoverable error)");
+			binding_failed(entry);
 			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			agent_update_gathering_done(agent);
+			if (agent->stun_monitoring) {
+				entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
+				agent_arm_keepalive(agent, entry);
+			}
 		}
 		break;
 	}

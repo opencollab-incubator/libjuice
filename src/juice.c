@@ -50,6 +50,19 @@ JUICE_EXPORT int juice_get_local_description(juice_agent_t *agent, char *buffer,
 	return JUICE_ERR_SUCCESS;
 }
 
+JUICE_EXPORT int juice_set_stun_monitoring(juice_agent_t *agent, bool enabled) {
+	if (!agent)
+		return JUICE_ERR_INVALID;
+	return agent_set_stun_monitoring(agent, enabled);
+}
+
+JUICE_EXPORT int juice_get_stun_binding(juice_agent_t *agent, unsigned int index,
+                                       juice_stun_binding_t *binding) {
+	if (!agent || !binding)
+		return JUICE_ERR_INVALID;
+	return agent_get_stun_binding(agent, index, binding);
+}
+
 JUICE_EXPORT int juice_set_remote_description(juice_agent_t *agent, const char *sdp) {
 	if (!agent || !sdp)
 		return JUICE_ERR_INVALID;
