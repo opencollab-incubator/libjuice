@@ -10,7 +10,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Configure isolated loopback regressions
-      run: cmake -B build -DNO_TESTS=ON -DPENDING_MUX_TESTS=ON -DENABLE_LOCALHOST_ADDRESS=ON -DWARNINGS_AS_ERRORS=ON
+      run: cmake -B build -DNO_TESTS=ON -DPENDING_MUX_TESTS=ON -DTIMESTAMP_TESTS=ON -DENABLE_LOCALHOST_ADDRESS=ON -DWARNINGS_AS_ERRORS=ON
     - name: Build
       run: cmake --build build --parallel 2
     - name: Test
