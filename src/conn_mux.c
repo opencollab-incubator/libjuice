@@ -736,12 +736,13 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 				return map_source(registry, src, relay, agent, now) ? agent : NULL;
 			}
 		}
-		if (ufrag_matched) {
-			++registry_impl->rejected;
-			return NULL;
-		}
+		// Past a direct agent sharing the ufrag too, as a client of the listener may share it
 		if (registry_impl->pending_required) {
 			defer_request(registry, src, relay, local_ufrag, remote_ufrag, buf, len, &msg);
+			return NULL;
+		}
+		if (ufrag_matched) {
+			++registry_impl->rejected;
 			return NULL;
 		}
 

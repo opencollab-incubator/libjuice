@@ -89,7 +89,8 @@ static void deferred_before_ready(void) {
 }
 
 // Generated ufrags are four characters, so live agents can share one. The password decides which
-// agent a request is for, behind a pending listener and in plain mux mode alike.
+// agent a request is for, behind a pending listener and in plain mux mode alike. One no agent's
+// password signs is held for the listener, whose own client may share the ufrag.
 static void shared_ufrag(bool pending) {
 	static const char other_password[] = "abcdefghijabcdefghijabcdefghij";
 	atomic_store(&calls, 0);
@@ -103,12 +104,51 @@ static void shared_ufrag(bool pending) {
 	test_send(wrong, port, "host", "peer", "wrongwrongwrongwrongwrongwrong");
 	assert(!test_answered(wrong));
 	juice_mux_stats_t stats = test_received(port, 2);
-	assert(stats.mapped_tuples == 1 && stats.rejected == 1 && atomic_load(&calls) == 0);
+	assert(stats.mapped_tuples == 1);
+	if (pending)
+		assert(juice_mux_reject_request("127.0.0.1", port, await_calls(1)) == 0);
+	else
+		assert(stats.rejected == 1 && atomic_load(&calls) == 0);
 	juice_destroy(second);
 	juice_destroy(first);
 	if (pending) assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
 	close(wrong);
 	close(fd);
+}
+
+// The listener's own client may share a direct agent's ufrag. The direct agent's peer still goes straight
+// to it, and a request only the client's password signs is held, verified, attached and answered.
+static void listener_client_shares_a_direct_ufrag(void) {
+	static const char listener_password[] = "abcdefghijabcdefghijabcdefghij";
+	atomic_store(&calls, 0);
+	uint16_t port = test_port(), direct_source, listener_source;
+	int direct_fd = test_socket(&direct_source), listener_fd = test_socket(&listener_source);
+	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, incoming, NULL) == 0);
+	juice_agent_t *direct = test_mux_agent_with(port, true, test_password);
+	juice_agent_t *client = test_mux_agent_with(port, false, listener_password);
+
+	test_send(direct_fd, port, "host", "peer", test_password);
+	test_response_for(direct_fd, test_password);
+	assert(atomic_load(&calls) == 0);
+
+	test_send(listener_fd, port, "host", "peer", listener_password);
+	uint64_t id = await_calls(1);
+	assert(juice_mux_verify_request("127.0.0.1", port, id, test_password) == JUICE_ERR_FAILED);
+	test_send(listener_fd, port, "host", "peer", listener_password);
+	id = await_calls(2);
+	assert(juice_mux_verify_request("127.0.0.1", port, id, listener_password) == 0);
+	assert(juice_mux_attach_request("127.0.0.1", port, id, direct) == JUICE_ERR_INVALID);
+	assert(juice_mux_attach_request("127.0.0.1", port, id, client) == 0);
+	test_response_for(listener_fd, listener_password);
+
+	juice_mux_stats_t stats;
+	assert(juice_mux_get_stats("127.0.0.1", port, &stats) == 0);
+	assert(stats.mapped_tuples == 2 && stats.pending == 0);
+	juice_destroy(client);
+	juice_destroy(direct);
+	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
+	close(listener_fd);
+	close(direct_fd);
 }
 
 // An agent checks no more remote addresses than its candidate limit, so no more map to it, however
@@ -135,7 +175,9 @@ int main(void) {
 	deferred_before_ready();
 	shared_ufrag(true);
 	shared_ufrag(false);
+	listener_client_shares_a_direct_ufrag();
 	caps_mapped_addresses();
 	puts("direct mux agents: ufrag routing beside a pending listener, held requests stay "
-	     "admission-only, shared ufrags, mapped addresses capped PASS");
+	     "admission-only, shared ufrags, a listener client sharing a direct ufrag, mapped "
+	     "addresses capped PASS");
 }
