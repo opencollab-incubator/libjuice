@@ -267,6 +267,13 @@ JUICE_EXPORT int juice_mux_set_admission(const char *bind_address, int local_por
  */
 JUICE_EXPORT int juice_mux_set_proxy_protocol(const char *bind_address, int local_port,
                                              const char *const *proxies, size_t count);
+/** Writes the relay a client comes through, as "address:port" like juice_get_selected_addresses.
+ * The client is a numeric address and its port, as the relay's header declared them. Returns
+ * JUICE_ERR_NOT_AVAIL when no relay speaks for it, including when none are set.
+ */
+JUICE_EXPORT int juice_mux_get_proxy_relay(const char *bind_address, int local_port,
+                                          const char *client_address, uint16_t client_port,
+                                          char *relay, size_t size);
 
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
 

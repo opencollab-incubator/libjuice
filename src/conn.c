@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #define INITIAL_REGISTRY_SIZE 16
@@ -396,6 +397,44 @@ int juice_mux_attach_request(const char *address, int port, uint64_t id, juice_a
 
 int juice_mux_reject_request(const char *address, int port, uint64_t id) {
 	return mux_request_operation(address, port, id, NULL, NULL, 2);
+}
+
+// A numeric address only, and no AI_ADDRCONFIG, which refuses IPv6 on a host without it
+static int parse_numeric(const char *host, uint16_t port, addr_record_t *record) {
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+	char service[8];
+	snprintf(service, sizeof(service), "%hu", port);
+	struct addrinfo *info = NULL;
+	if (getaddrinfo(host, service, &hints, &info) || !info)
+		return -1;
+	memset(record, 0, sizeof(*record));
+	memcpy(&record->addr, info->ai_addr, info->ai_addrlen);
+	record->len = (socklen_t)info->ai_addrlen;
+	record->socktype = SOCK_DGRAM;
+	freeaddrinfo(info);
+	return 0;
+}
+
+int juice_mux_get_proxy_relay(const char *address, int port, const char *client_address,
+                              uint16_t client_port, char *relay, size_t size) {
+	addr_record_t client;
+	if (!client_address || !relay || !size || port < 1 || port > 65535 || !client_port ||
+	    parse_numeric(client_address, client_port, &client))
+		return JUICE_ERR_INVALID;
+	// As a relay's header is read, so a v4-mapped client is its IPv4 flow
+	addr_unmap_inet6_v4mapped((struct sockaddr *)&client.addr, &client.len);
+	conn_registry_t *registry = lock_mux_registry(address, port);
+	if (!registry) return JUICE_ERR_NOT_AVAIL;
+	addr_record_t found;
+	int result = conn_mux_get_proxy_relay(registry, &client, &found);
+	unlock_mux_registry(registry);
+	if (result != 0) return result;
+	return addr_record_to_string(&found, relay, size) < 0 ? JUICE_ERR_FAILED : 0;
 }
 
 int juice_mux_get_stats(const char *address, int port, juice_mux_stats_t *stats) {

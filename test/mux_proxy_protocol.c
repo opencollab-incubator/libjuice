@@ -130,6 +130,42 @@ static void unmaps_a_v4_mapped_client(void) {
 	close(fd);
 }
 
+// A host can ask which relay a client came through, by the client the header declared
+static void names_the_relay_of_a_client(void) {
+	uint16_t port = test_port(), relay;
+	int fd = test_socket(&relay);
+	char found[64], expected[64];
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, CLIENT, 5555, found, sizeof(found)) ==
+	       JUICE_ERR_NOT_AVAIL);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	observed_t observed = {0};
+	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, incoming, &observed) == 0);
+
+	send_binding(fd, port, CLIENT);
+	await_callback(&observed, 1);
+	snprintf(expected, sizeof(expected), "127.0.0.1:%u", relay);
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, CLIENT, 5555, found, sizeof(found)) == 0);
+	assert(strcmp(found, expected) == 0);
+	// The same client written v4-mapped, as a dual-stack caller may
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, "::ffff:" CLIENT, 5555, found,
+	                                 sizeof(found)) == 0);
+	assert(strcmp(found, expected) == 0);
+	// Another port is another client, and a name is never looked up
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, CLIENT, 5556, found, sizeof(found)) ==
+	       JUICE_ERR_NOT_AVAIL);
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, "client.example", 5555, found,
+	                                 sizeof(found)) == JUICE_ERR_INVALID);
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, CLIENT, 5555, found, 4) ==
+	       JUICE_ERR_FAILED);
+
+	assert(juice_mux_listen_pending("127.0.0.1", port, NULL, NULL, NULL) == 0);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	assert(juice_mux_get_proxy_relay("127.0.0.1", port, CLIENT, 5555, found, sizeof(found)) ==
+	       JUICE_ERR_NOT_AVAIL);
+	close(fd);
+}
+
 // Peers only come through relays, so the rest is dropped whether it carries a header or not
 static void drops_what_no_relay_brings(void) {
 	uint16_t port = test_port(), source, relay;
@@ -246,10 +282,11 @@ int main(void) {
 	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
 	attributes_a_relayed_client();
 	unmaps_a_v4_mapped_client();
+	names_the_relay_of_a_client();
 	drops_what_no_relay_brings();
 	keeps_responses_to_its_own_requests();
 	serves_agents_without_a_listener();
 	refuses_an_invalid_range();
-	puts("mux PROXY protocol: relayed clients, kept across lists, the rest dropped except STUN "
-	     "responses, served without a listener PASS");
+	puts("mux PROXY protocol: relayed clients and their relays, kept across lists, the rest "
+	     "dropped except STUN responses, served without a listener PASS");
 }

@@ -1240,3 +1240,20 @@ int conn_mux_set_proxy_protocol(conn_registry_t *registry, const char *const *pr
 	conn_mux_interrupt_registry(registry);
 	return 0;
 }
+
+int conn_mux_get_proxy_relay(conn_registry_t *registry, const addr_record_t *client,
+                             addr_record_t *relay) {
+	// The caller holds the registry lock, which keeps the proxy, and routing runs under send_mutex
+	registry_impl_t *impl = registry->impl;
+	int result = JUICE_ERR_NOT_AVAIL;
+	mutex_lock(&impl->send_mutex);
+	if (impl->proxy) {
+		const addr_record_t *route = mux_proxy_route(impl->proxy, client);
+		if (route != client) {
+			*relay = *route;
+			result = 0;
+		}
+	}
+	mutex_unlock(&impl->send_mutex);
+	return result;
+}
