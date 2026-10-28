@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0 */
-#include "mux_test_helpers.h"
+#include "mux_proxy_helpers.h"
 #include <time.h>
 
 typedef struct observed {
@@ -23,50 +23,24 @@ static uint64_t await_callback(observed_t *observed, unsigned int count) {
 	return atomic_load(&observed->id);
 }
 
-#define CLIENT "203.0.113.7"
-
-// A relay's header for a datagram from the given client, IPv6 if it has a colon
-static size_t proxy_header(unsigned char *out, const char *client, uint16_t client_port,
-                           uint16_t port) {
-	static const unsigned char signature[12] = {0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
-	                                            0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A};
-	bool v6 = strchr(client, ':') != NULL;
-	int family = v6 ? AF_INET6 : AF_INET;
-	size_t length = v6 ? 16 : 4;
-	memcpy(out, signature, sizeof(signature));
-	out[12] = 0x21;            // v2, PROXY
-	out[13] = v6 ? 0x22 : 0x12; // datagram
-	out[14] = 0;
-	out[15] = (unsigned char)(2 * length + 4);
-	assert(inet_pton(family, client, out + 16) == 1);
-	assert(inet_pton(family, v6 ? "::1" : "127.0.0.1", out + 16 + length) == 1);
-	unsigned char *ports = out + 16 + 2 * length;
-	ports[0] = client_port >> 8;
-	ports[1] = client_port & 0xFF;
-	ports[2] = port >> 8;
-	ports[3] = port & 0xFF;
-	return 16 + 2 * length + 4;
+static void send_binding(int fd, uint16_t port, const char *client) {
+	send_signed(fd, port, client, 5555, test_password);
 }
 
-// A binding request, behind a header declaring client unless it is NULL
-static void send_binding(int fd, uint16_t port, const char *client) {
-	stun_message_t request = {0};
-	request.msg_class = STUN_CLASS_REQUEST;
-	request.msg_method = STUN_METHOD_BINDING;
-	request.priority = 123456;
-	request.ice_controlling = 123456789;
-	memcpy(request.transaction_id, "firstrequest", STUN_TRANSACTION_ID_SIZE);
-	snprintf(request.credentials.username, sizeof(request.credentials.username), "host:peer");
-	unsigned char datagram[2048];
-	size_t offset = client ? proxy_header(datagram, client, 5555, port) : 0;
-	int size =
-	    _juice_stun_write(datagram + offset, sizeof(datagram) - offset, &request, test_password);
-	assert(size > 0);
-	struct sockaddr_in destination = {.sin_family = AF_INET, .sin_port = htons(port)};
-	assert(inet_pton(AF_INET, "127.0.0.1", &destination.sin_addr) == 1);
-	size += (int)offset;
-	struct sockaddr *to = (struct sockaddr *)&destination;
-	assert(sendto(fd, datagram, size, 0, to, sizeof(destination)) == size);
+// Waits for a check the agent sends on its own, a binding request
+static bool await_check(int fd, int timeout_ms) {
+	for (int waited = 0; waited < timeout_ms; waited += 50) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		assert(poll(&pfd, 1, 50) >= 0);
+		if (!(pfd.revents & POLLIN)) continue;
+		unsigned char datagram[2048];
+		ssize_t size = recv(fd, datagram, sizeof(datagram), 0);
+		stun_message_t message = {0};
+		if (size > 0 && _juice_stun_read(datagram, size, &message) > 0 &&
+		    message.msg_class == STUN_CLASS_REQUEST)
+			return true;
+	}
+	return false;
 }
 
 static void attributes_a_relayed_client(void) {
@@ -268,6 +242,188 @@ static void serves_agents_without_a_listener(void) {
 	close(fd);
 }
 
+// A header alone never moves a client's route, nor does a check its agent's password fails
+static void keeps_a_route_from_unsigned_headers(void) {
+	static const char garbage[] = "not a STUN message";
+	uint16_t port = test_port(), relay, other;
+	int fd = test_socket(&relay), other_fd = test_socket(&other);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *agent = test_mux_agent(port, true);
+	send_binding(fd, port, CLIENT);
+	test_response(fd);
+	assert_relay(port, 5555, relay);
+
+	send_relayed(other_fd, port, CLIENT, 5555, garbage, sizeof(garbage));
+	send_signed(other_fd, port, CLIENT, 5555, "wrongwrongwrongwrongwrongwrong");
+	test_received(port, 3);
+	assert(!test_answered(other_fd));
+	assert_relay(port, 5555, relay);
+	send_binding(fd, port, NULL);
+	test_response(fd);
+
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(other_fd);
+	close(fd);
+}
+
+// A client moves to a relay port that brings a check its own agent's password signs
+static void moves_a_client_its_agent_authenticates(void) {
+	uint16_t port = test_port(), relay, other;
+	int fd = test_socket(&relay), other_fd = test_socket(&other);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *agent = test_mux_agent(port, true);
+	send_binding(fd, port, CLIENT);
+	test_response(fd);
+
+	send_binding(other_fd, port, CLIENT);
+	test_response(other_fd);
+	assert_relay(port, 5555, other);
+
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(other_fd);
+	close(fd);
+}
+
+// A check another agent's password signs moves neither a client nor its relay
+static void keeps_routes_from_other_agents(void) {
+	static const char other_password[] = "abcdefghijabcdefghijabcdefghij";
+	uint16_t port = test_port(), relay, other;
+	int fd = test_socket(&relay), other_fd = test_socket(&other);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *agent = test_mux_agent(port, true);
+	juice_agent_t *other_agent = test_mux_agent_with(port, true, other_password);
+	send_binding(fd, port, CLIENT);
+	test_response(fd);
+
+	// The client's address from elsewhere, and the client's relay port for another client
+	send_signed(other_fd, port, CLIENT, 5555, other_password);
+	send_signed(fd, port, CLIENT, 6666, other_password);
+	juice_mux_stats_t stats = test_received(port, 3);
+	assert(!test_answered(other_fd));
+	assert_relay(port, 5555, relay);
+	assert_relay(port, 6666, 0);
+	assert(juice_mux_get_stats("127.0.0.1", port, &stats) == 0 && stats.mapped_tuples == 1);
+	send_binding(fd, port, NULL);
+	test_response(fd);
+
+	juice_destroy(other_agent);
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(other_fd);
+	close(fd);
+}
+
+// A relay prefixing only the first datagram has the next ones attributed, though only a check
+// that authenticates routes the client
+static void attributes_after_a_first_datagram_that_is_not_a_check(void) {
+	static const char data[] = "application data";
+	uint16_t port = test_port(), relay;
+	int fd = test_socket(&relay);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *agent = test_mux_agent(port, true);
+	send_relayed(fd, port, CLIENT, 5555, data, sizeof(data));
+	test_received(port, 1);
+	assert_relay(port, 5555, 0);
+
+	send_binding(fd, port, NULL);
+	test_response(fd);
+	assert_relay(port, 5555, relay);
+
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(fd);
+}
+
+// A relay port passes to the next client once the agent of the one it routed is gone, whether the
+// relay declares the next client with every datagram or only the first
+static void hands_a_port_on_once_its_client_leaves(void) {
+	static const char data[] = "application data";
+	static const char second_password[] = "abcdefghijabcdefghijabcdefghij";
+	static const char third_password[] = "ABCDEFGHIJABCDEFGHIJABCDEFGHIJ";
+	uint16_t port = test_port(), relay;
+	int fd = test_socket(&relay);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *first = test_mux_agent(port, true);
+	send_binding(fd, port, CLIENT);
+	test_response(fd);
+	juice_destroy(first);
+
+	// Declared by the first datagram only, and never mistaken for the client that left
+	juice_agent_t *second = test_mux_agent_with(port, true, second_password);
+	send_relayed(fd, port, CLIENT, 6666, data, sizeof(data));
+	send_signed(fd, port, NULL, 0, second_password);
+	test_response_for(fd, second_password);
+	assert_relay(port, 6666, relay);
+	assert_relay(port, 5555, 0);
+	juice_destroy(second);
+
+	juice_agent_t *third = test_mux_agent_with(port, true, third_password);
+	send_signed(fd, port, CLIENT, 7777, third_password);
+	test_response_for(fd, third_password);
+	assert_relay(port, 7777, relay);
+	assert_relay(port, 6666, 0);
+
+	juice_destroy(third);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(fd);
+}
+
+// A client whose relay is dropped from the list is no longer reached at all
+static void never_reaches_a_client_straight(void) {
+	uint16_t port = test_port(), relay, client;
+	int fd = test_socket(&relay), client_fd = test_socket(&client);
+	const char *relays[] = {"127.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_agent_t *agent = test_mux_agent(port, true);
+	send_signed(fd, port, "127.0.0.1", client, test_password);
+	test_response(fd);
+	// The agent's own check of the client goes through the relay, and retries without an answer
+	assert(await_check(fd, 1000));
+
+	const char *others[] = {"10.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, others, 1) == 0);
+	assert(!await_check(client_fd, 1500));
+
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(client_fd);
+	close(fd);
+}
+
+// Nor is a candidate the client signaled checked straight, which would show it this endpoint
+static void never_checks_a_signaled_candidate_straight(void) {
+	uint16_t port = test_port(), client;
+	int client_fd = test_socket(&client);
+	const char *relays[] = {"10.0.0.0/8"};
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, relays, 1) == 0);
+	juice_config_t config = {0};
+	config.concurrency_mode = JUICE_CONCURRENCY_MODE_MUX;
+	config.mux_direct = true;
+	config.bind_address = "127.0.0.1";
+	config.local_port_range_begin = config.local_port_range_end = port;
+	juice_agent_t *agent = juice_create(&config);
+	assert(agent);
+	char description[256];
+	snprintf(description, sizeof(description),
+	         "a=ice-ufrag:peer\r\na=ice-pwd:012345678901234567890123456789\r\n"
+	         "a=candidate:1 1 UDP 2122317823 127.0.0.1 %u typ host\r\n",
+	         client);
+	assert(juice_set_remote_description(agent, description) == 0);
+	assert(juice_gather_candidates(agent) == 0);
+	assert(!await_check(client_fd, 1500));
+
+	juice_destroy(agent);
+	assert(juice_mux_set_proxy_protocol("127.0.0.1", port, NULL, 0) == 0);
+	close(client_fd);
+}
+
 static void refuses_an_invalid_range(void) {
 	uint16_t port = test_port();
 	const char *word[] = {"relay"};
@@ -286,7 +442,16 @@ int main(void) {
 	drops_what_no_relay_brings();
 	keeps_responses_to_its_own_requests();
 	serves_agents_without_a_listener();
+	keeps_a_route_from_unsigned_headers();
+	moves_a_client_its_agent_authenticates();
+	keeps_routes_from_other_agents();
+	attributes_after_a_first_datagram_that_is_not_a_check();
+	hands_a_port_on_once_its_client_leaves();
+	never_reaches_a_client_straight();
+	never_checks_a_signaled_candidate_straight();
 	refuses_an_invalid_range();
 	puts("mux PROXY protocol: relayed clients and their relays, kept across lists, the rest "
-	     "dropped except STUN responses, served without a listener PASS");
+	     "dropped except STUN responses, served without a listener, routes only moved by "
+	     "authenticated checks, ports handed on once their client leaves, nothing sent straight "
+	     "but STUN lookups PASS");
 }

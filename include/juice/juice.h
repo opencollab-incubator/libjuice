@@ -259,11 +259,15 @@ JUICE_EXPORT int juice_mux_set_admission(const char *bind_address, int local_por
                                         const juice_mux_admission_t *admission);
 /** Reads a PROXY protocol v2 header from the listed relays, given as numeric addresses or CIDR
  * ranges, and attributes their datagrams to the client address it declares. Replies to that
- * client go back through its relay, so a relay must use one source port per client. A listed
- * relay may omit the header after the first datagram of a flow; a header from anywhere else is
- * dropped. Any other datagram outside a flow is dropped too, except STUN responses, as peers only
- * come through relays. Keeps the endpoint open while set. A new list keeps the clients of relays
- * it still lists, and a count of 0 clears it.
+ * client go back through its relay once a binding request the relay brought authenticates for
+ * the client's agent, so a relay must use one source port per client. A port routing one client
+ * only passes to another once the first one's agent fails or is destroyed. While set, only STUN
+ * server lookups leave straight: anything else to a destination no relay routes is dropped, ICE
+ * checks to signaled candidates and TURN included. A listed relay may omit the header after
+ * the first datagram of a flow; a header from anywhere else is dropped. Any other datagram outside
+ * a flow is dropped too, except STUN responses, as peers only come through relays. Keeps the
+ * endpoint open while set. A new list keeps the clients of relays it still lists, and a count of
+ * 0 clears it.
  */
 JUICE_EXPORT int juice_mux_set_proxy_protocol(const char *bind_address, int local_port,
                                              const char *const *proxies, size_t count);

@@ -53,6 +53,9 @@ typedef struct pending_request {
 	uint64_t id;
 	timestamp_t deadline;
 	addr_record_t src;
+	// The PROXY protocol relay that brought it, which routes src once the request is attached
+	addr_record_t relay;
+	bool relayed;
 	char local_ufrag[257];
 	char remote_ufrag[257];
 	char password[257];
@@ -479,8 +482,9 @@ static bool admission_verifies(conn_registry_t *registry, char *data, size_t siz
 	return false;
 }
 
-static void defer_request(conn_registry_t *registry, const addr_record_t *src, const char *local,
-                          const char *remote, char *data, size_t size, const stun_message_t *msg) {
+static void defer_request(conn_registry_t *registry, const addr_record_t *src,
+                          const addr_record_t *relay, const char *local, const char *remote,
+                          char *data, size_t size, const stun_message_t *msg) {
 	registry_impl_t *impl = registry->impl;
 	if (!impl->cb_mux_pending || size > MAX_PENDING_PACKET_SIZE) {
 		++impl->rejected;
@@ -496,7 +500,9 @@ static void defer_request(conn_registry_t *registry, const addr_record_t *src, c
 			return; // Duplicates neither replace the first packet nor extend its deadline.
 		}
 	}
+	// A relay that could not route src on attach is refused now, before anyone is notified
 	if (impl->pending_count >= impl->max_pending ||
+	    (relay && !mux_proxy_admits(impl->proxy, relay, src)) ||
 	    !admission_verifies(registry, data, size, msg, local)) {
 		++impl->rejected;
 		return;
@@ -509,6 +515,10 @@ static void defer_request(conn_registry_t *registry, const addr_record_t *src, c
 	mutex_unlock(&request_id_mutex);
 	if (!request->id) { free(request); ++impl->rejected; return; }
 	request->src = *src;
+	if (relay) {
+		request->relay = *relay;
+		request->relayed = true;
+	}
 	request->deadline = current_timestamp() + impl->pending_timeout_ms;
 	strcpy(request->local_ufrag, local);
 	strcpy(request->remote_ufrag, remote);
@@ -632,12 +642,24 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 	return count;
 }
 
-// Maps src to the agent a datagram from it authenticated for
-static bool map_source(conn_registry_t *registry, const addr_record_t *src, juice_agent_t *agent) {
+// Whether the datagram is a binding request signed with the agent's credentials
+static bool authenticates(juice_agent_t *agent, char *buf, size_t len) {
+	stun_message_t msg;
+	return is_stun_datagram(buf, len) && stun_read(buf, len, &msg) >= 0 &&
+	       msg.msg_class == STUN_CLASS_REQUEST && msg.has_integrity &&
+	       agent_verify_stun_binding(agent, buf, len, &msg) == 0;
+}
+
+// Maps src to the agent a datagram from it authenticated for, routed through the relay that
+// brought the datagram if any
+static bool map_source(conn_registry_t *registry, const addr_record_t *src,
+                       const addr_record_t *relay, juice_agent_t *agent, timestamp_t now) {
 	registry_impl_t *impl = registry->impl;
 	conn_impl_t *conn_impl = agent->conn_impl;
 	// An agent checks no more remote addresses than this, so further ones would serve nothing
-	if (conn_impl->mapped >= ICE_MAX_CANDIDATES_COUNT || insert_map_entry(impl, src, agent) != 0) {
+	if (conn_impl->mapped >= ICE_MAX_CANDIDATES_COUNT ||
+	    (relay && impl->proxy && mux_proxy_commit(impl->proxy, relay, src, now) != 0) ||
+	    insert_map_entry(impl, src, agent) != 0) {
 		++impl->rejected;
 		return false;
 	}
@@ -645,8 +667,10 @@ static bool map_source(conn_registry_t *registry, const addr_record_t *src, juic
 	return true;
 }
 
+// relay is the PROXY protocol relay that brought the datagram, when it does not route src yet
 static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t len,
-                                   const addr_record_t *src) {
+                                   const addr_record_t *src, const addr_record_t *relay,
+                                   timestamp_t now) {
 	JLOG_VERBOSE("Looking up agent from address");
 
 	registry_impl_t *registry_impl = registry->impl;
@@ -654,6 +678,10 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	juice_agent_t *agent = entry && entry->type == MAP_ENTRY_TYPE_FULL ? entry->agent : NULL;
 	if (agent) {
 		JLOG_DEBUG("Found agent from address");
+		// A relay new to the client routes it only once the client's own credentials sign a
+		// datagram it brought, such as a consent check. The datagram is passed on either way.
+		if (relay && is_ready(agent) && authenticates(agent, buf, len))
+			mux_proxy_commit(registry_impl->proxy, relay, src, now);
 		return agent;
 	}
 
@@ -705,7 +733,7 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 				// are short, so another agent may share this one: only the password tells them apart.
 				if (agent_verify_stun_binding(agent, buf, len, &msg) != 0)
 					continue;
-				return map_source(registry, src, agent) ? agent : NULL;
+				return map_source(registry, src, relay, agent, now) ? agent : NULL;
 			}
 		}
 		if (ufrag_matched) {
@@ -713,7 +741,7 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 			return NULL;
 		}
 		if (registry_impl->pending_required) {
-			defer_request(registry, src, local_ufrag, remote_ufrag, buf, len, &msg);
+			defer_request(registry, src, relay, local_ufrag, remote_ufrag, buf, len, &msg);
 			return NULL;
 		}
 
@@ -760,8 +788,9 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 }
 
 static void process_datagram(conn_registry_t *registry, char *data, size_t size,
-                              const addr_record_t *src) {
-    juice_agent_t *agent = lookup_agent(registry, data, size, src);
+                             const addr_record_t *src, const addr_record_t *relay,
+                             timestamp_t now) {
+    juice_agent_t *agent = lookup_agent(registry, data, size, src, relay, now);
     if (!agent || !is_ready(agent)) {
         JLOG_DEBUG("Agent not found for incoming datagram, dropping");
         return;
@@ -791,7 +820,8 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	while (impl->ready_head) {
 		pending_request_t *request = impl->ready_head;
 		juice_agent_t *agent = request->agent;
-		if (is_ready(agent) && map_source(registry, &request->src, agent)) {
+		const addr_record_t *relay = request->relayed ? &request->relay : NULL;
+		if (is_ready(agent) && map_source(registry, &request->src, relay, agent, now)) {
 			conn_impl_t *connection = agent->conn_impl;
 			if (agent_conn_recv(agent, request->data, request->size, &request->src) != 0)
 				connection->finished = true;
@@ -819,11 +849,14 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 			++impl->received;
 			char *data = buffer;
 			size_t size = (size_t)ret;
-			if (impl->proxy && mux_proxy_receive(impl->proxy, &data, &size, &src, now) != 0) {
+			addr_record_t relay;
+			int relayed =
+			    impl->proxy ? mux_proxy_receive(impl->proxy, &data, &size, &src, &relay, now) : 0;
+			if (relayed < 0) {
 				++impl->rejected;
 				continue;
 			}
-			process_datagram(registry, data, size, &src);
+			process_datagram(registry, data, size, &src, relayed ? &relay : NULL, now);
 		}
 
 		if (ret < 0) {
@@ -1005,9 +1038,13 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	// A client behind a relay is reached through it
 	const addr_record_t *to =
-	    registry_impl->proxy ? mux_proxy_route(registry_impl->proxy, dst) : dst;
+	    registry_impl->proxy ? mux_proxy_route(registry_impl->proxy, dst, data, size) : dst;
+	if (!to) {
+		JLOG_VERBOSE("Dropping datagram to a destination no relay routes");
+		mutex_unlock(&registry_impl->send_mutex);
+		return (int)size; // lost, as far as the agent can tell
+	}
 	int ret = udp_sendto(registry_impl->sock, data, size, to);
 	if (ret < 0) {
 		ret = -sockerrno;
@@ -1234,13 +1271,23 @@ int conn_mux_set_admission(conn_registry_t *registry, const juice_mux_admission_
 	return 0;
 }
 
+// Whether an agent that could still hear from the client is mapped to it. A failed agent lost ICE
+// consent, which only the client's own credentials renew.
+static bool client_alive(const addr_record_t *client, void *ptr) {
+	registry_impl_t *impl = ((conn_registry_t *)ptr)->impl;
+	map_entry_t *entry = find_map_entry(impl, client, false);
+	return entry && entry->type == MAP_ENTRY_TYPE_FULL && is_ready(entry->agent) &&
+	       entry->agent->state != JUICE_STATE_FAILED;
+}
+
 int conn_mux_set_proxy_protocol(conn_registry_t *registry, const char *const *proxies,
                                 size_t count) {
 	// The caller holds the registry lock, so nothing receives meanwhile
 	registry_impl_t *impl = registry->impl;
 	mux_proxy_t *proxy = NULL;
 	if (count) {
-		int ret = mux_proxy_create(proxies, count, &impl->send_mutex, impl->proxy, &proxy);
+		int ret = mux_proxy_create(proxies, count, &impl->send_mutex, client_alive, registry,
+		                           impl->proxy, &proxy);
 		if (ret != 0)
 			return ret;
 	}
@@ -1260,13 +1307,20 @@ int conn_mux_get_proxy_relay(conn_registry_t *registry, const addr_record_t *cli
 	registry_impl_t *impl = registry->impl;
 	int result = JUICE_ERR_NOT_AVAIL;
 	mutex_lock(&impl->send_mutex);
-	if (impl->proxy) {
-		const addr_record_t *route = mux_proxy_route(impl->proxy, client);
-		if (route != client) {
-			*relay = *route;
-			result = 0;
-		}
+	const addr_record_t *found = impl->proxy ? mux_proxy_relay(impl->proxy, client) : NULL;
+	if (found) {
+		*relay = *found;
+		result = 0;
 	}
 	mutex_unlock(&impl->send_mutex);
+	if (result == 0 || !impl->proxy)
+		return result;
+	// A held request names its relay too, though the relay only routes the client once attached
+	for (pending_request_t *request = impl->pending_tail; request; request = request->previous) {
+		if (request->relayed && addr_record_is_equal(&request->src, client, true)) {
+			*relay = request->relay;
+			return 0;
+		}
+	}
 	return result;
 }
