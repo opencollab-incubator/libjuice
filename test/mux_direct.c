@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include "mux_test_helpers.h"
+#include "ice.h"
 
 static atomic_uint calls, unexpected;
 static atomic_uint_fast64_t last_id;
@@ -110,11 +111,31 @@ static void shared_ufrag(bool pending) {
 	close(fd);
 }
 
+// An agent checks no more remote addresses than its candidate limit, so no more map to it, however
+// many its password signs for
+static void caps_mapped_addresses(void) {
+	enum { SOURCES = ICE_MAX_CANDIDATES_COUNT + 10 };
+	uint16_t port = test_port(), source;
+	int fds[SOURCES];
+	juice_agent_t *agent = test_mux_agent(port, true);
+	for (int i = 0; i < SOURCES; ++i) {
+		fds[i] = test_socket(&source);
+		test_send(fds[i], port, "host", "peer", test_password);
+	}
+	juice_mux_stats_t stats = test_received(port, SOURCES);
+	assert(stats.mapped_tuples == ICE_MAX_CANDIDATES_COUNT);
+	assert(stats.rejected == SOURCES - ICE_MAX_CANDIDATES_COUNT);
+	juice_destroy(agent);
+	for (int i = 0; i < SOURCES; ++i) close(fds[i]);
+}
+
 int main(void) {
 	juice_set_log_level(JUICE_LOG_LEVEL_FATAL);
 	connectivity();
 	deferred_before_ready();
 	shared_ufrag(true);
 	shared_ufrag(false);
-	puts("direct mux agents: ufrag routing beside a pending listener, held requests stay admission-only, shared ufrags PASS");
+	caps_mapped_addresses();
+	puts("direct mux agents: ufrag routing beside a pending listener, held requests stay "
+	     "admission-only, shared ufrags, mapped addresses capped PASS");
 }

@@ -120,6 +120,7 @@ typedef struct conn_impl {
 	conn_registry_t *registry;
 	timestamp_t next_timestamp;
 	bool finished;
+	int mapped; // source addresses mapped to the agent
 } conn_impl_t;
 
 static conn_registry_t **conn_mux_registries;
@@ -631,6 +632,19 @@ int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t 
 	return count;
 }
 
+// Maps src to the agent a datagram from it authenticated for
+static bool map_source(conn_registry_t *registry, const addr_record_t *src, juice_agent_t *agent) {
+	registry_impl_t *impl = registry->impl;
+	conn_impl_t *conn_impl = agent->conn_impl;
+	// An agent checks no more remote addresses than this, so further ones would serve nothing
+	if (conn_impl->mapped >= ICE_MAX_CANDIDATES_COUNT || insert_map_entry(impl, src, agent) != 0) {
+		++impl->rejected;
+		return false;
+	}
+	++conn_impl->mapped;
+	return true;
+}
+
 static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t len,
                                    const addr_record_t *src) {
 	JLOG_VERBOSE("Looking up agent from address");
@@ -691,8 +705,7 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 				// are short, so another agent may share this one: only the password tells them apart.
 				if (agent_verify_stun_binding(agent, buf, len, &msg) != 0)
 					continue;
-				if (insert_map_entry(registry_impl, src, agent) != 0) return NULL;
-				return agent;
+				return map_source(registry, src, agent) ? agent : NULL;
 			}
 		}
 		if (ufrag_matched) {
@@ -778,7 +791,7 @@ int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
 	while (impl->ready_head) {
 		pending_request_t *request = impl->ready_head;
 		juice_agent_t *agent = request->agent;
-		if (is_ready(agent) && insert_map_entry(impl, &request->src, agent) == 0) {
+		if (is_ready(agent) && map_source(registry, &request->src, agent)) {
 			conn_impl_t *connection = agent->conn_impl;
 			if (agent_conn_recv(agent, request->data, request->size, &request->src) != 0)
 				connection->finished = true;
